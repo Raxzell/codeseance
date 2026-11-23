@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "Run Backend Pytest on Python Save",
+  "description": "Automatically runs pytest on backend/tests whenever any backend Python file is modified to verify Git archaeology, Ship-of-Theseus drift bounds, and zero-hallucination citation invariants.",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "backend/**/*.py"
+    ]
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "pytest backend/tests -v"
+  }
+}
