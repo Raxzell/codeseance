@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -339,3 +341,175 @@ def test_verify_citations_strips_hallucinations_and_tampered_fields() -> None:
     assert cited.date == real.date
     assert cited.file_path in real.files_changed
     assert cited.commit_message == real.message
+
+
+def test_api_health_and_presets_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.main import app
+
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    client = TestClient(app)
+    health_resp = client.get("/api/health")
+    assert health_resp.status_code == 200
+    health = health_resp.json()
+    assert health["status"] == "ok"
+    assert health["llm_configured"] is False
+    assert health["llm_provider"] == "extractive"
+    assert health["presets_available"] == 3
+
+    presets_resp = client.get("/api/presets")
+    assert presets_resp.status_code == 200
+    presets = presets_resp.json()
+    assert len(presets) == 3
+    assert [p["preset_id"] for p in presets] == [
+        "legacy-billing-monolith",
+        "phoenix-auth-gateway",
+        "haunted-cache-daemon",
+    ]
+
+
+def test_api_summon_preset_and_ask_extractive_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.main import app
+
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def _forbid(*args, **kwargs):
+        raise AssertionError("Extractive preset flow must never call network/LLM!")
+
+    monkeypatch.setattr("app.git_archaeologist._ingest_via_git_clone", _forbid)
+    monkeypatch.setattr("app.git_archaeologist._ingest_via_github_api", _forbid)
+    monkeypatch.setattr("app.seance_rag._call_llm_responder", _forbid)
+
+    client = TestClient(app)
+    summon_resp = client.post("/api/repo/summon", json={"preset_id": "legacy-billing-monolith"})
+    assert summon_resp.status_code == 200
+    repo_data = summon_resp.json()
+    valid_hashes = {c["commit_hash"] for c in repo_data["commits"]}
+
+    questions = [
+        "Why was the billing ledger rewritten from float to Decimal?",
+        "Which file is the biggest bug hotspot?",
+        "Why was queue_worker.py deleted from the architecture?",
+        "Which module remained untouched since genesis?",
+    ]
+    for q in questions:
+        ask_resp = client.post(
+            "/api/seance/ask",
+            json={"repo_id": repo_data["repo_id"], "question": q},
+        )
+        assert ask_resp.status_code == 200
+        body = ask_resp.json()
+        assert body["mode"] == "extractive"
+        assert body["answer"].strip() != ""
+        assert len(body["citations"]) >= 1
+        for citation in body["citations"]:
+            assert citation["commit_hash"] in valid_hashes
+
+
+def test_api_error_status_codes() -> None:
+    from app.main import app
+
+    client = TestClient(app)
+
+    assert client.post("/api/repo/summon", json={"preset_id": "does-not-exist"}).status_code == 404
+    assert client.post("/api/repo/summon", json={"repo_url": "file:///etc/passwd"}).status_code == 400
+    assert client.post("/api/repo/summon", json={}).status_code == 422
+    assert (
+        client.post(
+            "/api/seance/ask",
+            json={"repo_id": "preset:never-summoned", "question": "Why?"},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            "/api/seance/ask",
+            json={"repo_id": "preset:legacy-billing-monolith", "question": "   "},
+        ).status_code
+        == 422
+    )
+
+
+def test_seance_llm_mode_strips_hallucinated_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.seance_rag import ask_seance
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    repo = summon_preset("legacy-billing-monolith", store=RepoStore())
+    real_commit = repo.commits[0]
+
+    def _fake_post(self, url, **kwargs):
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "answer": f"Grounded response citing [{real_commit.short_hash}].",
+                                "cited_hashes": [
+                                    "deadbeef" * 5,
+                                    real_commit.commit_hash,
+                                    "12345678" * 5,
+                                ],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        return httpx.Response(200, json=payload, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.Client, "post", _fake_post)
+
+    result = ask_seance(repo, "Why was the ledger dead-letter retry state flushed?")
+    assert result.mode == "llm"
+    assert len(result.citations) == 1
+    assert result.citations[0].commit_hash == real_commit.commit_hash
+    assert result.citations[0].author == real_commit.author
+
+
+def test_seance_llm_failure_falls_back_to_extractive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.seance_rag import ask_seance
+
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+
+    repo = summon_preset("phoenix-auth-gateway", store=RepoStore())
+    valid_hashes = {c.commit_hash for c in repo.commits}
+
+    def _failing_post(self, url, **kwargs):
+        raise httpx.ConnectError("Simulated network outage")
+
+    monkeypatch.setattr(httpx.Client, "post", _failing_post)
+
+    result = ask_seance(repo, "How did session handling fix the fixation vulnerability?")
+    assert result.mode == "extractive"
+    assert result.answer.strip() != ""
+    assert len(result.citations) >= 1
+    assert all(c.commit_hash in valid_hashes for c in result.citations)
+
+
+def test_seance_off_topic_query_reports_no_matching_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.seance_rag import ask_seance
+
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    repo = summon_preset("haunted-cache-daemon", store=RepoStore())
+    result = ask_seance(repo, "quantum banana smoothie recipe")
+    assert result.mode == "extractive"
+    assert result.citations == []
+    assert result.retrieved_commit_count == 0
+    assert "no verified commit record" in result.answer.lower()
+

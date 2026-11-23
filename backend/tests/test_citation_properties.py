@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+import httpx
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -16,6 +20,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from app.ast_analyzer import analyze_commits, compute_file_drift, verify_citations  # noqa: E402
 from app.models import MAX_COMMITS, MAX_DIFF_CHARS, CommitNode, FileDiff, RepoSummary  # noqa: E402
+from app.seance_rag import ask_seance  # noqa: E402
 
 _HEX_HASH_ST = st.text(alphabet="0123456789abcdef", min_size=40, max_size=40)
 _FILE_PATH_ST = st.sampled_from(
@@ -256,3 +261,90 @@ def test_property_compute_file_drift_edge_bounds(
         assert score == 100.0
     elif post_additions <= 0 and post_deletions <= 0:
         assert score == 0.0
+
+
+@settings(max_examples=25, deadline=None)
+@given(
+    raw_commits=commit_graph_strategy(),
+    question=st.one_of(
+        st.sampled_from(
+            [
+                "Why was this module rewritten?",
+                "Which file is the most fragile bug hotspot?",
+                "Which files remained untouched since genesis?",
+                "Summarize the architectural evolution",
+            ]
+        ),
+        st.text(min_size=1, max_size=40).filter(lambda s: bool(s.strip())),
+    ),
+)
+def test_property_ask_seance_extractive_strictly_grounded(
+    raw_commits: list[CommitNode],
+    question: str,
+) -> None:
+    """Property 5 & 1: Zero-key extractive mode returns verified citations with zero network calls."""
+    repo = _build_repo_from_commits(raw_commits)
+    valid_map = {c.commit_hash: c for c in repo.commits}
+
+    clean_env = {k: v for k, v in os.environ.items() if k not in {"GROQ_API_KEY", "OPENAI_API_KEY"}}
+    with patch.dict(os.environ, clean_env, clear=True):
+        response = ask_seance(repo, question)
+
+    assert response.mode == "extractive"
+    assert response.answer.strip() != ""
+    for citation in response.citations:
+        assert citation.commit_hash in valid_map
+        real_commit = valid_map[citation.commit_hash]
+        assert citation.short_hash == real_commit.short_hash
+        assert citation.author == real_commit.author
+        assert citation.date == real_commit.date
+        assert citation.commit_message == real_commit.message
+        if real_commit.files_changed:
+            assert citation.file_path in real_commit.files_changed
+        else:
+            assert citation.file_path == "(commit-level)"
+
+
+@settings(max_examples=25, deadline=None)
+@given(
+    raw_commits=commit_graph_strategy(),
+    fake_hashes=st.lists(_HEX_HASH_ST, min_size=1, max_size=6),
+    include_real=st.booleans(),
+)
+def test_property_ask_seance_llm_never_leaks_fake_hashes(
+    raw_commits: list[CommitNode],
+    fake_hashes: list[str],
+    include_real: bool,
+) -> None:
+    """Property 1 (Adversarial LLM): Fabricated SHA-1 hashes returned by an LLM never leak into Citation."""
+    repo = _build_repo_from_commits(raw_commits)
+    valid_hashes = {c.commit_hash for c in repo.commits}
+    cited = list(fake_hashes)
+    if include_real and repo.commits:
+        cited.append(repo.commits[0].commit_hash)
+
+    def _mock_post(self, url, **kwargs):
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "answer": "Archival synthesis from retrieved commit records.",
+                                "cited_hashes": cited,
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        return httpx.Response(200, json=payload, request=httpx.Request("POST", url))
+
+    with patch.dict(os.environ, {"GROQ_API_KEY": "pbt-key"}, clear=False):
+        with patch.object(httpx.Client, "post", _mock_post):
+            response = ask_seance(repo, "Summarize the architectural evolution")
+
+    assert response.answer.strip() != ""
+    for citation in response.citations:
+        assert citation.commit_hash in valid_hashes
+

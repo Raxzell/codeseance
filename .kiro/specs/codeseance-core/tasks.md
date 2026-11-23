@@ -22,9 +22,9 @@ _Requirements: 1, 2, 3, 6 | Correctness Properties: 1, 2, 3, 4, 6_
 
 ## Task 3: Grounded Séance RAG Engine & FastAPI Endpoints
 _Requirements: 1, 2, 3, 4, 6 | Correctness Properties: 1, 2, 5_
-- [ ] 3.1 Implement `backend/app/seance_rag.py` with pure-Python BM25/TF-IDF commit retrieval, optional Groq/OpenAI LLM responder, deterministic extractive citation fallback (`mode: "extractive"`), and mandatory `verify_citations` post-guard.
-- [ ] 3.2 Implement `backend/app/main.py` exposing `GET /api/health`, `GET /api/presets`, `POST /api/repo/summon`, and `POST /api/seance/ask` with CORS and structured error handling.
-- [ ] 3.3 Add API integration, extractive fallback, and adversarial citation-verification tests in `backend/tests/` and verify `pytest backend/tests -v` passes 100%.
+- [x] 3.1 Implement `backend/app/seance_rag.py` with pure-Python BM25/TF-IDF commit retrieval, optional Groq/OpenAI LLM responder, deterministic extractive citation fallback (`mode: "extractive"`), and mandatory `verify_citations` post-guard.
+- [x] 3.2 Implement `backend/app/main.py` exposing `GET /api/health`, `GET /api/presets`, `POST /api/repo/summon`, and `POST /api/seance/ask` with CORS and structured error handling.
+- [x] 3.3 Add API integration, extractive fallback, and adversarial citation-verification tests in `backend/tests/` and verify `pytest backend/tests -v` passes 100%.
 
 ---
 
