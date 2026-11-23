@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import threading
 from collections import OrderedDict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import httpx
@@ -35,6 +35,43 @@ _DIFF_HEADER_RE = re.compile(r'^diff --git "?a/(.+?)"? "?b/(.+?)"?$')
 _SUMMARY_CREATE_RE = re.compile(r"^\s*create mode \d+\s+(.+)$")
 _SUMMARY_DELETE_RE = re.compile(r"^\s*delete mode \d+\s+(.+)$")
 _SUMMARY_RENAME_RE = re.compile(r"^\s*rename\s+(.+)\s+\(\d+%\)$")
+
+_LOCKFILE_NAMES = frozenset(
+    {
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "cargo.lock",
+        "uv.lock",
+        "gemfile.lock",
+        "composer.lock",
+        "pipfile.lock",
+    }
+)
+_BINARY_OR_MINIFIED_SUFFIXES = (
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".zip",
+    ".wasm",
+    ".pyc",
+)
+
+
+def _is_noisy_lock_or_binary(file_path: str) -> bool:
+    """Return True for lockfiles, minified bundles, and binary artifacts whose diffs should be omitted."""
+    norm = file_path.replace("\\", "/").strip().lower()
+    name = PurePosixPath(norm).name
+    return name in _LOCKFILE_NAMES or norm.endswith(_BINARY_OR_MINIFIED_SUFFIXES)
 
 
 class InvalidRepoURLError(ValueError):
@@ -1038,7 +1075,12 @@ def _parse_diff_blocks(diff_output: str) -> dict[str, list[tuple[str, str]]]:
 
     def _flush_file() -> None:
         nonlocal current_file, hunk_lines
-        if current_hash and current_file and hunk_lines:
+        if (
+            current_hash
+            and current_file
+            and hunk_lines
+            and not _is_noisy_lock_or_binary(current_file)
+        ):
             existing = diffs_by_commit.setdefault(current_hash, [])
             if len(existing) < MAX_DIFF_FILES_PER_COMMIT:
                 snippet = truncate_diff("\n".join(hunk_lines))
@@ -1060,7 +1102,7 @@ def _parse_diff_blocks(diff_output: str) -> dict[str, list[tuple[str, str]]]:
             current_file = header_match.group(2)
             continue
 
-        if current_file is not None:
+        if current_file is not None and not _is_noisy_lock_or_binary(current_file):
             if line.startswith(("@@", "+", "-", " ")) and not line.startswith(("--- ", "+++ ")):
                 hunk_lines.append(line)
 
@@ -1183,10 +1225,16 @@ def _extract_commits_from_local_repo(
 
         hunk_map = dict(diffs_by_commit.get(commit_hash, []))
         file_diffs: list[FileDiff] = []
-        for idx, fp in enumerate(files_order):
+        stored_snippets = 0
+        for fp in files_order:
             adds, dels = file_stats.get(fp, (0, 0))
             status = file_statuses.get(fp, "modified")
-            snippet = hunk_map.get(fp, "") if idx < MAX_DIFF_FILES_PER_COMMIT else ""
+            if _is_noisy_lock_or_binary(fp) or stored_snippets >= MAX_DIFF_FILES_PER_COMMIT:
+                snippet = ""
+            else:
+                snippet = hunk_map.get(fp, "")
+                if snippet:
+                    stored_snippets += 1
             file_diffs.append(
                 FileDiff(
                     file_path=fp,
@@ -1308,7 +1356,8 @@ def _ingest_via_github_api(owner: str, repo: str) -> list[CommitNode]:
                         stats = detail.get("stats") or {}
                         total_adds = max(0, int(stats.get("additions") or 0))
                         total_dels = max(0, int(stats.get("deletions") or 0))
-                        for f_idx, f_item in enumerate(detail.get("files") or []):
+                        stored_api_snippets = 0
+                        for f_item in detail.get("files") or []:
                             fp = str(f_item.get("filename") or "").strip()
                             if not fp:
                                 continue
@@ -1317,11 +1366,15 @@ def _ingest_via_github_api(owner: str, repo: str) -> list[CommitNode]:
                             mapped_status = "deleted" if raw_status == "removed" else (
                                 raw_status if raw_status in {"added", "modified", "deleted", "renamed"} else "modified"
                             )
-                            patch = (
-                                truncate_diff(str(f_item.get("patch") or ""))
-                                if f_idx < MAX_DIFF_FILES_PER_COMMIT
-                                else ""
-                            )
+                            if (
+                                _is_noisy_lock_or_binary(fp)
+                                or stored_api_snippets >= MAX_DIFF_FILES_PER_COMMIT
+                            ):
+                                patch = ""
+                            else:
+                                patch = truncate_diff(str(f_item.get("patch") or ""))
+                                if patch:
+                                    stored_api_snippets += 1
                             file_diffs.append(
                                 FileDiff(
                                     file_path=fp,

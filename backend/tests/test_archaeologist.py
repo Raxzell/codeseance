@@ -513,3 +513,33 @@ def test_seance_off_topic_query_reports_no_matching_record(
     assert result.retrieved_commit_count == 0
     assert "no verified commit record" in result.answer.lower()
 
+
+def test_lockfile_and_binary_diffs_omitted_from_snippet_budget(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "noisy_repo"
+    repo_dir.mkdir()
+
+    def _git(*args: str) -> None:
+        res = subprocess.run(
+            ["git", "-C", str(repo_dir), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res.returncode == 0, f"git {args} failed: {res.stderr}"
+
+    _git("init")
+    _git("config", "user.name", "Audit Bot")
+    _git("config", "user.email", "audit@codeseance.dev")
+
+    (repo_dir / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    (repo_dir / "app.py").write_text("def handle_health():\n    return 'ok'\n", encoding="utf-8")
+    _git("add", "package-lock.json", "app.py")
+    _git("commit", "-m", "feat: add lockfile and app handler")
+
+    commits = _extract_commits_from_local_repo(repo_dir, max_commits=MAX_COMMITS)
+    assert len(commits) == 1
+    diffs_by_file = {d.file_path: d for d in commits[0].diffs}
+    assert diffs_by_file["package-lock.json"].diff_snippet == ""
+    assert "def handle_health" in diffs_by_file["app.py"].diff_snippet
+
+
